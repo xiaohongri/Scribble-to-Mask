@@ -1,6 +1,23 @@
 # Modified DAVIS interactive robot https://github.com/albertomontesg/davis-interactive
 # I tamed their robot to work as a slave for me
 
+"""
+TamedRobot: Automated Point Sampling from Error Regions for Scribble Generation
+
+This module implements an automated scribble generation algorithm that samples points
+from error regions (false positives/negatives in segmentation masks) to create 
+natural-looking scribbles for interactive segmentation training.
+
+Point Sampling Strategy:
+1. Skeleton Generation: Extract the medial axis (skeleton) of the error region
+2. Graph Construction: Convert skeleton pixels into a graph with connected components
+3. Path Finding: Find the longest paths in each connected component
+4. Bezier Curve Sampling: Sample points along bezier curves fitted to the paths
+5. Line Rendering: Use Bresenham's algorithm to create continuous pixel lines
+
+The algorithm creates smooth, realistic scribbles that follow the shape of error regions,
+mimicking human annotation behavior.
+"""
 
 import time
 import networkx as nx
@@ -15,18 +32,29 @@ import cv2
 
 def bezier_curve(points, nb_points=1000):
     """ Given a list of points compute a bezier curve from it.
-
+    
+    This function performs point sampling by creating a smooth bezier curve through
+    the given control points. The sampling is uniform along the parametric curve
+    using parameter values t ∈ [0, 1].
+    
+    Point Sampling Method:
+    - Uses Bernstein polynomials to interpolate between control points
+    - Samples nb_points uniformly spaced points along the parametric curve
+    - Each point is computed as: P(t) = Σ B(n,i,t) * P_i
+      where B(n,i,t) = C(n,i) * t^(n-i) * (1-t)^i is the Bernstein basis
+    
     # Arguments
         points: ndarray. Array of points with shape (N, 2) with N being the
             number of points and the second dimension representing the
             (x, y) coordinates.
         nb_points: Integer. Number of points to sample from the bezier curve.
             This value must be larger than the number of points given in
-            `points`. Maximum value 10000.
+            `points`. Maximum value 10000. Default is 1000, which provides
+            smooth curves for most scribble generation tasks.
 
     # Returns
-        ndarray: Array of shape (1000, 2) with the bezier curve of the
-            given path of points.
+        ndarray: Array of shape (nb_points, 2) with the sampled points along
+            the bezier curve.
 
     """
     nb_points = min(nb_points, 1000)
@@ -55,6 +83,17 @@ def bezier_curve(points, nb_points=1000):
 
 def bresenham(points):
     """ Apply Bresenham algorithm for a list points.
+    
+    This algorithm creates continuous pixel lines between consecutive points,
+    ensuring no gaps in the final scribble. It's a critical step in converting
+    the sampled bezier curve points into a drawable mask.
+    
+    Point Sampling Behavior:
+    - For each consecutive pair of points, interpolates all pixels along the line
+    - Uses integer arithmetic for efficiency
+    - Guarantees 8-connected pixel connectivity (no diagonal gaps)
+    - The resulting points form a continuous, rasterized line suitable for
+      creating binary scribble masks
 
     More info: https://en.wikipedia.org/wiki/Bresenham's_line_algorithm
 
@@ -65,6 +104,7 @@ def bresenham(points):
 
     # Returns
         ndarray: Array of points after having applied the bresenham algorithm.
+            Contains all pixels along the lines connecting consecutive input points.
     """
 
     points = np.asarray(points, dtype=np.int)
@@ -116,6 +156,49 @@ def bresenham(points):
 
 
 class TamedRobot(object):
+    """
+    Automated scribble generator that samples points from error regions.
+    
+    This class implements a sophisticated point sampling algorithm for generating
+    realistic scribbles from segmentation error regions. The sampling process
+    follows these steps:
+    
+    1. Skeleton Extraction (_generate_scribble_mask):
+       - Applies morphological operations to smooth the error region
+       - Extracts the medial axis (skeleton) - a thin representation of the shape
+       - The skeleton provides initial candidate points for sampling
+    
+    2. Graph Construction (_mask2graph):
+       - Converts skeleton pixels into graph nodes
+       - Connects nearby pixels (within sqrt(2) distance) with weighted edges
+       - Edge weights represent distances between pixels
+    
+    3. Path Selection (_acyclics_subgraphs, _longest_path_in_tree):
+       - Decomposes the graph into connected components
+       - Removes cycles by pruning high-weight edges
+       - Finds the longest path in each tree-like component
+       - Longer paths produce more visible, meaningful scribbles
+    
+    4. Bezier Curve Sampling (bezier_curve):
+       - Fits smooth bezier curves through the selected path points
+       - Samples nb_points (default 1000) uniformly along each curve
+       - Creates natural-looking, smooth scribbles
+    
+    5. Line Rendering (bresenham):
+       - Converts sampled points into continuous pixel lines
+       - Ensures no gaps in the final scribble mask
+    
+    Parameters:
+        kernel_size: float. Proportion of the region's side length used for
+                     morphological operations (default 0.15)
+        max_kernel_radius: int. Maximum radius for morphological kernels
+                          (default 16 pixels)
+        min_nb_nodes: int. Minimum nodes required in a graph component
+                     (default 4)
+        nb_points: int. Number of points to sample along each bezier curve
+                  (default 1000). Higher values create smoother curves but
+                  increase computation time.
+    """
 
     def __init__(self,
                  kernel_size=.15,
@@ -130,16 +213,31 @@ class TamedRobot(object):
 
     def _generate_scribble_mask(self, mask):
         """ Generate the skeleton from a mask
+        
+        Step 1 of Point Sampling: Extract candidate points from the error region.
+        
+        This method performs morphological operations to smooth and thin the error
+        region into a skeleton (medial axis), which represents the "centerline" of
+        the shape. The skeleton provides initial point samples that capture the
+        region's topology.
+        
+        Algorithm:
+        1. Calculate adaptive kernel size based on region area (kernel_radius ∝ sqrt(area))
+        2. Apply morphological minimum then maximum (close operation) to remove noise
+        3. Compute medial axis - the set of points equidistant from boundaries
+        4. The resulting skeleton pixels become candidate points for scribble generation
+        
         Given an error mask, the medial axis is computed to obtain the
         skeleton of the objects. In order to obtain smoother skeleton and
         remove small objects, an erosion and dilation operations are performed.
         The kernel size used is proportional the squared of the area.
 
         # Arguments
-            mask: Numpy Array. Error mask
+            mask: Numpy Array. Error mask (binary, with 1s indicating errors)
 
         Returns:
-            skel: Numpy Array. Skeleton mask
+            skel: Numpy Array. Skeleton mask (binary, with 1s indicating skeleton pixels)
+                  These pixels serve as initial point samples for the scribble.
         """
         mask = np.asarray(mask, dtype=np.uint8)
         side = np.sqrt(np.sum(mask > 0))
@@ -168,14 +266,29 @@ class TamedRobot(object):
 
     def _mask2graph(self, skeleton_mask):
         """ Transforms a skeleton mask into a graph
+        
+        Step 2 of Point Sampling: Organize skeleton points into a connected graph.
+        
+        This method converts the discrete skeleton pixels into a graph structure,
+        where each skeleton pixel becomes a node and nearby pixels are connected
+        with edges. This enables path-finding algorithms to extract meaningful
+        scribble trajectories.
+        
+        Algorithm:
+        1. Extract (x,y) coordinates of all skeleton pixels
+        2. Build a radius neighbors graph - connect pixels within sqrt(2) distance
+           (sqrt(2) allows 8-connectivity: horizontal, vertical, and diagonal neighbors)
+        3. Edge weights represent Euclidean distances between connected pixels
+        4. Convert to NetworkX graph for path analysis
 
         Args:
-            skeleton_mask (ndarray): Skeleton mask
+            skeleton_mask (ndarray): Skeleton mask (binary)
 
         Returns:
             tuple(nx.Graph, ndarray): Returns a tuple where the first element
-                is a Graph and the second element is an array of xy coordinates
-                indicating the coordinates for each Graph node.
+                is a Graph with skeleton pixels as nodes and the second element 
+                is an array of xy coordinates indicating the coordinates for each 
+                Graph node.
 
                 If an empty mask is given, None is returned.
         """
@@ -199,6 +312,21 @@ class TamedRobot(object):
 
     def _acyclics_subgraphs(self, G):
         """ Divide a graph into connected components subgraphs
+        
+        Step 3a of Point Sampling: Decompose the graph and remove cycles.
+        
+        Cycles in the skeleton graph represent regions where multiple paths exist.
+        For clean scribble generation, we want tree-like structures (acyclic graphs)
+        where there's a single path between any two points. This step breaks cycles
+        by removing the highest-weight (longest) edge in each cycle.
+        
+        Algorithm:
+        1. Decompose graph into connected components
+        2. For each component, find cycles using NetworkX
+        3. Remove the edge with maximum weight (distance) in each cycle
+        4. Repeat until the graph is acyclic (tree-like)
+        5. The resulting trees enable unambiguous longest-path extraction
+        
         Divide a graph into connected components subgraphs and remove its
         cycles removing the edge with higher weight inside the cycle. Also
         prune the graphs by number of nodes in case the graph has not enought
@@ -209,7 +337,8 @@ class TamedRobot(object):
 
         Returns:
             list(nx.Graph): Returns a list of graphs which are subgraphs of G
-                with cycles removed.
+                with cycles removed. Each subgraph is a tree suitable for
+                path extraction.
         """
         if not isinstance(G, nx.Graph):
             raise TypeError('G must be a nx.Graph instance')
@@ -236,6 +365,22 @@ class TamedRobot(object):
 
     def _longest_path_in_tree(self, G):
         """ Given a tree graph, compute the longest path and return it
+        
+        Step 3b of Point Sampling: Find the longest path in each tree component.
+        
+        The longest path represents the most significant feature of the error region,
+        spanning from one end to the other. This creates the most informative scribble
+        that best captures the region's extent and shape.
+        
+        Algorithm (Two-pass approach):
+        1. Start from an arbitrary node v
+        2. Find the furthest node v' from v using shortest path (in a tree,
+           shortest path = only path = longest path in terms of number of edges)
+        3. From v', find the longest path to any other node
+        4. This path is guaranteed to be the diameter (longest path) of the tree
+        
+        The points along this path become control points for bezier curve fitting.
+        
         Given an undirected tree graph, compute the longest path and return it.
 
         The approach use two shortest path transversals (shortest path in a
@@ -248,7 +393,8 @@ class TamedRobot(object):
 
         Returns:
             list(int): Returns a list of indexes of the nodes belonging to the
-                longest path.
+                longest path. These node indices correspond to (x,y) coordinates
+                that will be used as control points for bezier curve sampling.
         """
         if not isinstance(G, nx.Graph):
             raise TypeError('G must be a nx.Graph instance')
@@ -267,6 +413,34 @@ class TamedRobot(object):
         return list(longest_path)
 
     def interact(self, error_mask):
+        """
+        Main method: Generate scribbles from an error mask through point sampling.
+        
+        This is the complete point sampling pipeline that converts an error region
+        into a scribble mask. The algorithm follows these steps:
+        
+        1. Downsample the error mask (2x) for faster processing
+        2. Generate skeleton using medial axis (extract initial point samples)
+        3. Convert skeleton to graph (organize points into connected structure)
+        4. Decompose into acyclic subgraphs (prepare for path finding)
+        5. Find longest paths in each component (select most significant points)
+        6. Fit bezier curves through path points (smooth interpolation)
+        7. Sample points along bezier curves (nb_points=1000 per curve)
+        8. Apply Bresenham algorithm (create continuous pixel lines)
+        9. Upsample back to original resolution (2x)
+        
+        The result is a binary mask containing smooth, continuous scribbles that
+        follow the shape of the error region, suitable for training interactive
+        segmentation models.
+        
+        Args:
+            error_mask: Binary mask indicating segmentation errors (false positives
+                       or false negatives). Shape: (H, W)
+        
+        Returns:
+            out_mask: Binary scribble mask with the same shape as input.
+                     Contains 1s along the sampled scribble lines, 0s elsewhere.
+        """
         # start_time = time.time()
         out_mask = np.zeros_like(error_mask)
 
@@ -297,6 +471,10 @@ class TamedRobot(object):
         # print('longest time', t)
 
         # t_start = time.time()
+        # Step 4: Fit bezier curves and sample points
+        # For each longest path, create a smooth bezier curve and sample nb_points
+        # along it. This converts the discrete skeleton path into a dense, smooth
+        # set of points that will form a natural-looking scribble.
         scribbles_paths = [
             bezier_curve(p, self.nb_points) for p in longest_paths
         ]
@@ -304,8 +482,12 @@ class TamedRobot(object):
         # print('asub time', t)
 
         # t_start = time.time()
+        # Step 5: Convert sampled points to pixel masks using Bresenham
+        # The bezier-sampled points are at arbitrary floating-point coordinates.
+        # Bresenham's algorithm converts them into discrete, connected pixel
+        # coordinates. We also upsample by 2x here to restore original resolution.
         for path in scribbles_paths:
-            # Re-upsample the line
+            # Re-upsample the line (was downsampled 2x earlier)
             path = bresenham(path*2)
             out_mask[path[:, 1], path[:, 0]] = 1
         # t = (time.time() - t_start) 

@@ -6,6 +6,8 @@
 
 A simplistic network that turns scribbles to mask. It supports multi-object segmentation using soft-aggregation. Don't expect SOTA results from this model!
 
+For detailed information about how point sampling works in scribble generation, see [Point Sampling Methodology](docs/POINT_SAMPLING.md).
+
 ![Ex1](https://imgur.com/HesuB4x.gif) ![Ex2](https://imgur.com/NmCrCE1.gif)
 
 ## Overall structure and capabilities
