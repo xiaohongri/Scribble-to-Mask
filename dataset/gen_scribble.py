@@ -1,3 +1,38 @@
+"""
+Scribble Generation Module
+
+This module provides multiple methods for generating training scribbles from 
+segmentation masks. It simulates human annotation behavior by creating various
+types of scribbles (boundary, curve, thinned) from error regions.
+
+Point Sampling Strategies:
+
+1. Boundary Scribbles (get_boundary_scribble):
+   - Samples points along the boundary of error regions
+   - Uses morphological gradient after erosion
+   - Creates scribbles that trace object edges
+
+2. Curve Scribbles (get_curve_scribble):
+   - Randomly samples 3 control points from the error region
+   - Fits quadratic Bezier curves through the points
+   - Evaluates curves at 1024 uniformly spaced parameter values (t ∈ [0,1])
+   - Generates 2-4 curves per region, selects longest ones
+   - Creates natural, smooth scribbles through object interiors
+
+3. Thinned Scribbles (get_thinned_scribble):
+   - Uses Zhang-Suen thinning algorithm to skeletonize the region
+   - Samples points along the skeleton
+   - Creates scribbles following the region's medial axis
+
+4. Robot Scribbles (TamedRobot):
+   - Uses sophisticated graph-based point sampling (see tamed_robot.py)
+   - Mimics DAVIS interactive annotation protocol
+   - Samples points along longest paths in skeleton graphs
+
+The main function get_scribble() randomly combines these methods to generate
+diverse training data that helps the model generalize to different annotation styles.
+"""
+
 import numpy as np
 import cv2
 import bezier
@@ -23,6 +58,30 @@ def get_boundary_scribble(region):
     return scribble
 
 def get_curve_scribble(region, min_srb=2, max_srb=4, sort=True):
+    """
+    Generate curve-based scribbles by sampling points and fitting Bezier curves.
+    
+    This method creates smooth, natural-looking scribbles by:
+    1. Randomly sampling 3 control points from the error region
+    2. Fitting a quadratic Bezier curve through these points
+    3. Evaluating the curve at 1024 uniformly spaced parameter values
+    4. Rendering the curve as a polyline with thickness 3
+    
+    Point Sampling Details:
+    - Control points are randomly selected from region pixels
+    - Bezier curves use parametric evaluation: P(t) = Σ B_i(t) * P_i, t ∈ [0,1]
+    - 1024 evaluation points provide smooth curves (can be adjusted)
+    - Multiple curves are generated and the longest ones are kept
+    
+    Args:
+        region: Binary mask of the error region to scribble
+        min_srb: Minimum number of scribble lines to generate
+        max_srb: Maximum number of scribble lines to generate
+        sort: If True, generate more curves and select the longest ones
+        
+    Returns:
+        Binary mask containing the curve scribbles
+    """
     # Draw random curves
     num_lines = np.random.randint(min_srb, max_srb)
 
@@ -35,8 +94,10 @@ def get_curve_scribble(region, min_srb=2, max_srb=4, sort=True):
     else:
         num_gen = num_lines
     for _ in range(num_gen):
+        # Sample 3 random control points from the region
         region_indices = np.argwhere(region)
         include_idx = np.random.choice(region_indices.shape[0], size=3, replace=False)
+        # Create Bezier curve nodes for x and y separately
         y_nodes = np.asfortranarray([
             [0.0, 0.5, 1.0],
             region_indices[include_idx, 0],
@@ -45,14 +106,17 @@ def get_curve_scribble(region, min_srb=2, max_srb=4, sort=True):
             [0.0, 0.5, 1.0],
             region_indices[include_idx, 1],
         ])
+        # Fit quadratic Bezier curves
         x_curve = bezier.Curve(x_nodes, degree=2)
         y_curve = bezier.Curve(y_nodes, degree=2)
+        # Evaluate at 1024 uniformly spaced points (dense sampling for smoothness)
         x_pts = x_curve.evaluate_multi(eval_pts)
         y_pts = y_curve.evaluate_multi(eval_pts)
 
         this_scribble = np.zeros_like(region)
         pts = np.stack([x_pts[1,:], y_pts[1,:]], 1)
         pts = pts.reshape((-1, 1, 2)).astype(np.int32)
+        # Draw polyline connecting all sampled points with thickness 3
         this_scribble = cv2.polylines(this_scribble, [pts], isClosed=False, color=(1), thickness=3)
 
         # Mask away path outside the allowed region, allow some error in labeling
@@ -84,6 +148,27 @@ def get_thinned_scribble(region):
 
 robot = TamedRobot()
 def get_scribble(mask, gt, from_zero):
+    """
+    Main scribble generation function with multiple sampling strategies.
+    
+    This function generates positive and negative scribbles for training by:
+    1. Computing error regions (false positives and false negatives)
+    2. Selecting a point sampling strategy (robot or manual methods)
+    3. For each error region, randomly choosing scribble types
+    4. Optionally combining multiple scribble types for diversity
+    
+    Point Sampling Strategies Used:
+    - Robot (75% probability): Graph-based sampling via TamedRobot
+    - Manual (25% probability): Random combination of boundary/thinned/curve scribbles
+    
+    Args:
+        mask: Current segmentation prediction (0-255 grayscale)
+        gt: Ground truth segmentation (0-255 grayscale)
+        from_zero: If True, simulate annotation from scratch (no previous mask)
+        
+    Returns:
+        tuple: (pos_scr, neg_scr) - Binary masks for positive and negative scribbles
+    """
     mask = mask > 128
     gt = gt > 128
 
